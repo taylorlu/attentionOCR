@@ -34,9 +34,9 @@ class AttentionModel(object):
         # contexts(batch, w*h, d), output(batch, h)
 
         reshaped_contexts = tf.reshape(contexts, [-1, self.channels])  # (batch*w*h, d)
-        if(is_train):
-            reshaped_contexts = tf.layers.dropout(reshaped_contexts, rate=0.5)
-            output = tf.layers.dropout(output, rate=0.5)    # (batch, h)
+
+        reshaped_contexts = tf.layers.dropout(reshaped_contexts, rate=0.0)
+        output = tf.layers.dropout(output, rate=0.0)    # (batch, h)
 
         temp1 = tf.layers.dense(reshaped_contexts, units=attention_dim) # (batch*w*h, att)
         temp2 = tf.layers.dense(output, units=attention_dim)
@@ -45,8 +45,7 @@ class AttentionModel(object):
 
         temp = tf.math.tanh(temp1 + temp2)    # (batch*w*h, att)
 
-        if(is_train):
-            temp = tf.layers.dropout(temp, rate=0.5)
+        temp = tf.layers.dropout(temp, rate=0.0)
 
         logits = tf.layers.dense(temp, units=1, use_bias=False) # (batch*w*h, 1)
 
@@ -56,7 +55,9 @@ class AttentionModel(object):
         return alpha
 
 
-    def buildAttention(self, features, labels=None, masks=None, is_train=True):
+    def buildAttention(self, features, labels=None, masks=None,
+                        last_word=None, last_output=None, last_memory=None,
+                        is_train=True):
 
         features = tf.reshape(features, [self.batch_size, -1, self.channels])  # (batch, w*h, d)
         # Batch Normalization
@@ -95,19 +96,26 @@ class AttentionModel(object):
         # Initialize the LSTM using the mean context
         with tf.variable_scope("initialize"):
             context_mean = tf.reduce_mean(features, axis=1)
-            last_memory, last_output = self.initialize(context_mean)
+            self.initial_memory, self.initial_output = self.initialize(context_mean)
+
+            # Training only initial once, Testing stage need last state as input
+            if(is_train):
+                last_memory = self.initial_memory
+                last_output = self.initial_output
             last_state = last_memory, last_output
 
-        last_word = tf.zeros([self.batch_size], tf.int32)
         predictions = []
         if(is_train):
+            last_word = tf.zeros([self.batch_size], tf.int32)
             cross_entropies = []
             alphas = []
+        else:
+            self.max_step = 1
 
         for idx in range(self.max_step):
             # Attention mechanism
             with tf.variable_scope("attend", reuse=tf.AUTO_REUSE):
-                alpha = self.attend(features, last_output, is_train)  # (batch, w*h)
+                alpha = self.attend(features, last_output, True)  # (batch, w*h)
                 context = tf.reduce_sum(features*tf.expand_dims(alpha, 2), axis=1)  # (batch, d)
                 if(is_train):
                     tiled_masks = tf.tile(tf.expand_dims(masks[:, idx], 1),
@@ -133,7 +141,7 @@ class AttentionModel(object):
                     expanded_output = tf.layers.dropout(expanded_output, rate=0.5)
 
                 logits = tf.layers.dense(expanded_output, units=self.vocabulary_size, use_bias=False)
-                self.probs = tf.nn.softmax(logits)
+                probs = tf.nn.softmax(logits)
                 prediction = tf.argmax(logits, 1)
                 predictions.append(prediction)
 
@@ -142,13 +150,12 @@ class AttentionModel(object):
                 cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels[:, idx], logits=logits)
                 masked_cross_entropy = cross_entropy * masks[:, idx]
                 cross_entropies.append(masked_cross_entropy)
-                last_output = output
-                last_state = state
                 last_word = labels[:, idx]
-            else:
-                last_output = output
-                last_state = state
-                last_word = prediction
+
+            # Current step state
+            last_output = output
+            last_state = state
+            last_memory = state[1]
 
         if(is_train):
             cross_entropies = tf.stack(cross_entropies, axis=1)
@@ -166,19 +173,24 @@ class AttentionModel(object):
             total_loss = cross_entropy_loss + attention_loss + reg_loss
             return total_loss
         else:
-            self._predictions = predictions
-            return predictions
+            return probs, last_output, last_memory
 
 
     def init_inference(self):
         # feed inputs placeholder here
-        self.inputs = tf.placeholder(tf.float32, [None, 224, 224, 3], name='input')
+        self.inputs = tf.placeholder(tf.float32, [None, 224, 224, 3], name='inputs')
+        self.last_word = tf.placeholder(tf.int32, [None], name='last_word')
+        self.last_output = tf.placeholder(tf.float32, [None, self.num_lstm_units], name='last_output')
+        self.last_memory = tf.placeholder(tf.float32, [None, self.num_lstm_units], name='last_memory')
 
         features = backbone.resnet_2D_v1(self.inputs, trainable=False)
         self.channels = features.get_shape().as_list()[-1]
         self.num_ctx = features.get_shape().as_list()[1]*features.get_shape().as_list()[2]
-        self._predictions = self.buildAttention(features, is_train=False)
-        self._init_inference = True
+        probs, last_output, last_memory = self.buildAttention(features, last_word=self.last_word,
+                                                                last_output=self.last_output,
+                                                                last_memory=self.last_memory,
+                                                                is_train=False)
+        return probs, last_output, last_memory
 
 
     def init_inference_for_train(self):
@@ -211,7 +223,8 @@ class AttentionModel(object):
         self._init_train = True
 
 
-    def feed_dict(self, inputs, labels=None, masks=None):
+    def feed_dict(self, inputs, labels=None, masks=None,
+                    last_word=None, last_output=None, last_memory=None):
         """
         Constructs the feed dictionary from given inputs necessary to run
         an operations for the model.
@@ -227,22 +240,27 @@ class AttentionModel(object):
             A dictionary of placeholder keys and feed values.
         """
         feed_dict = {self.inputs : inputs}
-        if(labels):
+
+        if(labels is not None):
             label_dict = {self.labels : labels}
             feed_dict.update(label_dict)
-        if(masks):
+        if(masks is not None):
             mask_dict = {self.masks : masks}
             feed_dict.update(mask_dict)
+
+        if(last_word is not None):
+            last_word_dict = {self.last_word : last_word}
+            feed_dict.update(last_word_dict)
+        if(last_output is not None):
+            last_output_dict = {self.last_output : last_output}
+            feed_dict.update(last_output_dict)
+        if(last_memory is not None):
+            last_memory_dict = {self.last_memory : last_memory}
+            feed_dict.update(last_memory_dict)
 
         return feed_dict
 
 
-    def predictions(self):
-        # assert self._init_inference, "Must init inference module."
-        _pred = []
-        for timstep in self._predictions:
-            _pred.append(timstep[30])
-        return _pred
 
     @property
     def cost(self):
