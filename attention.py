@@ -97,20 +97,16 @@ class AttentionModel(object):
         with tf.variable_scope("initialize"):
             context_mean = tf.reduce_mean(features, axis=1)
             self.initial_memory, self.initial_output = self.initialize(context_mean)
-
-            # Training only initial once, Testing stage need last state as input
-            if(is_train):
-                last_memory = self.initial_memory
-                last_output = self.initial_output
+            
+            last_memory = self.initial_memory
+            last_output = self.initial_output
             last_state = last_memory, last_output
 
         predictions = []
+        last_word = tf.zeros([self.batch_size], tf.int32)
         if(is_train):
-            last_word = tf.zeros([self.batch_size], tf.int32)
             cross_entropies = []
             alphas = []
-        else:
-            self.max_step = 1
 
         for idx in range(self.max_step):
             # Attention mechanism
@@ -156,6 +152,7 @@ class AttentionModel(object):
             last_output = output
             last_state = state
             last_memory = state[1]
+            last_word = prediction
 
         if(is_train):
             cross_entropies = tf.stack(cross_entropies, axis=1)
@@ -173,24 +170,18 @@ class AttentionModel(object):
             total_loss = cross_entropy_loss + attention_loss + reg_loss
             return total_loss
         else:
-            return probs, last_output, last_memory
+            return predictions
 
 
     def init_inference(self):
         # feed inputs placeholder here
         self.inputs = tf.placeholder(tf.float32, [None, 224, 224, 3], name='inputs')
-        self.last_word = tf.placeholder(tf.int32, [None], name='last_word')
-        self.last_output = tf.placeholder(tf.float32, [None, self.num_lstm_units], name='last_output')
-        self.last_memory = tf.placeholder(tf.float32, [None, self.num_lstm_units], name='last_memory')
 
         features = backbone.resnet_2D_v1(self.inputs, trainable=False)
         self.channels = features.get_shape().as_list()[-1]
         self.num_ctx = features.get_shape().as_list()[1]*features.get_shape().as_list()[2]
-        probs, last_output, last_memory = self.buildAttention(features, last_word=self.last_word,
-                                                                last_output=self.last_output,
-                                                                last_memory=self.last_memory,
-                                                                is_train=False)
-        return probs, last_output, last_memory
+        probs = self.buildAttention(features, is_train=False)
+        return probs
 
 
     def init_inference_for_train(self):
